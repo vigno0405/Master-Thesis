@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt # type: ignore
 from mpl_toolkits.mplot3d import Axes3D # type: ignore
 import termios
 import tty
+import torch
 
 # User-defined
 from jacobians import *
@@ -328,7 +329,7 @@ if tryFlag:
 # ======================================================================================
 
 # Use v4l2-ctl --list-devices for the usb camera
-cap = cv2.VideoCapture(2, cv2.CAP_V4L2)
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
 
 def capture_image():
     """Captures an image from the USB camera and returns it as a NumPy array, or None if the capture fails."""
@@ -375,11 +376,7 @@ coords0 = np.array([1e-4, 1e-4, 140, 1e-4, 1e-4, 1e-4])
 # Sampling movements (datasets)
 y = []			    # ground truth
 X_images = []		# images
-
-y_dDELTAL = []      # dDELTAL
-X_xyz0 = []         # xyz0
-X_dxyz = []         # dxyz
-X_DELTAL0 = []      # DELTAL0
+X_DELTAL = []       # tendon lengths
 
 diameter = 60  # tuned base diameter [mm]
 d = diameter / 2  # constant section
@@ -387,11 +384,10 @@ L0 = 140  # rest length [mm]
 
 # Print initial position
 x_abs, y_abs, z_abs = positions.get('TIP')
-roll_abs, pitch_abs, yaw_abs = angles.get('TIP')
+yaw_abs, pitch_abs, roll_abs = angles.get('TIP')
 x_base, y_base, z_base = positions.get('BASE')
-roll_base, pitch_base, yaw_base = angles.get('BASE')
-mocap_xyzZYX = relative_coordinates(x_abs,y_abs,z_abs,roll_abs,pitch_abs,yaw_abs,x_base,y_base,z_base,roll_base,pitch_base,yaw_base)
-xyz1 = mocap_xyzZYX
+yaw_base, pitch_base, roll_base = angles.get('BASE')
+mocap_xyzZYX = relative_coordinates(x_abs,y_abs,z_abs,yaw_abs,pitch_abs,roll_abs,x_base,y_base,z_base,yaw_base,pitch_base,roll_base)
 
 print(f"Initial position = {mocap_xyzZYX}")
 
@@ -402,14 +398,13 @@ DELTAL1, _, _ = coordinates2tendon(DELTAL0, DxDyDl0, coords0, mocap_xyzZYX[:3] -
 mocap_BASE = []
 mocap_TIP = []
 
-time.sleep(3)
+time.sleep(1)
 
 N_data = 1000
 for i in range(N_data):
 
     # Sample d_DELTAL
-    DELTAL_sample = np.random.uniform(low=-65, high=30, size=3)
-    X_DELTAL0.append(DELTAL1)
+    DELTAL_sample = np.random.uniform(low=-50, high=20, size=3)
 
     # Move and save position
     d_DELTAL_real = move_motors(DELTAL_sample - DELTAL1)
@@ -429,12 +424,11 @@ for i in range(N_data):
     mocap_BASE.append([x_base,y_base,z_base,yaw_base,pitch_base,roll_base])
 
     # For the dataset
+    time.sleep(0.01)
     image_dataset = capture_image()
 
     # Capture and show image
     if image_dataset is not None:
-        cv2.imshow("Camera Output", image_dataset)
-        cv2.waitKey(1)                              # 1 ms
         image_rgb = cv2.cvtColor(image_dataset, cv2.COLOR_BGR2RGB)
     else:
         print("[ERROR] No image captured.")
@@ -442,35 +436,54 @@ for i in range(N_data):
     # Construction of datasets
     y.append(mocap_xyzZYX)
     X_images.append(image_rgb)
+    X_DELTAL.append(DELTAL1)
 
-    # For the Jacobian
-    y_dDELTAL.append(d_DELTAL_real)
-    X_xyz0.append(xyz1)
-    X_dxyz.append(mocap_xyzZYX - xyz1)
-
-    # Update of xyz1
-    xyz1 = mocap_xyzZYX
-
-    time.sleep(0.1)
+    time.sleep(0.01)
 
 # Conversion for saving
 mocap_BASE = np.array(mocap_BASE, dtype=np.float32)
 mocap_TIP = np.array(mocap_TIP, dtype=np.float32)
-y = np.array(y, dtype=np.float32)
-X_images = np.array(X_images, dtype=np.uint8)
+y_np = np.array(y, dtype=np.float32)
+X_images_np = np.array(X_images, dtype=np.uint8)
+X_DELTAL_np = np.array(X_DELTAL, dtype=np.float32)
 
-# Jacobian
-y_dDELTAL = np.array(y_dDELTAL, dtype=np.float32)   # note that for the final one it is enough to apply cumsum (with DELTAL1 found in the same way): inverse kinematics
-X_xyz0 = np.array(X_xyz0, dtype = np.float32)       # first MOCAP value
-X_dxyz = np.array(X_dxyz, dtype = np.float32)
-X_DELTAL0 = np.array(X_DELTAL0, dtype = np.float32)
+# Prepare Pytorch dataset
+X_images = [torch.from_numpy(img).permute(2, 0, 1).contiguous() for img in X_images_np]
+y = [torch.tensor(v, dtype=torch.float32) for v in y_np]
+X_DELTAL = [torch.tensor(v, dtype=torch.float32) for v in X_DELTAL_np]
 
-# Save datasets for Google Colab/TensorFlow usage
-np.savez('Dataset12.npz', y=y, X_images=X_images)
-np.savez('Backup_mocap12.npz', mocap_BASE=mocap_BASE, mocap_TIP=mocap_TIP)
-np.savez('Jacobian12.npz', y_dDELTAL=y_dDELTAL, X_dxyz=X_dxyz, X_xyz0=X_xyz0, X_DELTAL0=X_DELTAL0)
+data_dict = {
+    "X_images": X_images,
+    "y": y,
+    "X_DELTAL": X_DELTAL
+}
 
-print(f"--- Data collection completed and saved, for {N_data} points ---")
+final_backup = {
+    "mocap_BASE": mocap_BASE,
+    "mocap_TIP": mocap_TIP
+}
+
+# Save the file
+while True:
+    dataset_number = input("Enter dataset number: ").strip()
+    if not dataset_number.isdigit():
+        print("[ERROR] Invalid number. Try again.")
+        continue
+
+    save_path_pt = f"Dataset{dataset_number}.pt"
+    save_path_npz = f"Backup_mocap{dataset_number}.npz"
+
+    if os.path.exists(save_path_pt) or os.path.exists(save_path_npz):
+        print(f"[ERROR] Files with number {dataset_number} already exist.")
+        continue
+
+    break
+
+torch.save(data_dict, save_path_pt)
+np.savez(save_path_npz, **final_backup)
+
+print(f"[OK] Saved: {save_path_pt} ({len(data_dict['X_images'])} samples)")
+print(f"[OK] Saved: {save_path_npz} ({final_backup['mocap_BASE'].shape[0]} mocap samples)")
 
 # =======================================================================================
 #                              Close the Camera
